@@ -1,10 +1,10 @@
 import logging
-import time
-from contextlib import contextmanager
+import traceback
 from dataclasses import dataclass
-from typing import Generator, List
+from typing import Callable, List, TypeVar
 
 
+T = TypeVar("T")
 LOGGER_NAME = "task_manager"
 
 
@@ -14,9 +14,7 @@ def configure_logger() -> logging.Logger:
         return logger
 
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
@@ -30,79 +28,83 @@ def configure_logger() -> logging.Logger:
 
 
 @dataclass
-class TraceState:
-    operation: str
-    start_time: float
+class AlertService:
+    logger: logging.Logger
+
+    def notify(self, operation: str, level: int, message: str) -> None:
+        print("!!! Ошибка !!!")
+        self.logger.warning(
+            "ALERT | operation=%s | level=%s | message=%s",
+            operation,
+            logging.getLevelName(level),
+            message,
+        )
+
+        if level >= logging.CRITICAL:
+            # External integrations (Sentry, Application Insights, email) can be added here.
+            self.logger.critical(
+                "ALERT_EXTERNAL | operation=%s | target=Sentry/ApplicationInsights/Email",
+                operation,
+            )
 
 
-@contextmanager
-def trace_operation(logger: logging.Logger, operation: str) -> Generator[TraceState, None, None]:
-    state = TraceState(operation=operation, start_time=time.perf_counter())
-    logger.info("TRACE START | operation=%s", operation)
-    try:
-        yield state
-    except Exception as exc:
-        duration_ms = (time.perf_counter() - state.start_time) * 1000
-        logger.error(
-            "TRACE END | operation=%s | result=ERROR | duration_ms=%.2f | reason=%s",
+@dataclass
+class ExceptionHandler:
+    logger: logging.Logger
+    alerts: AlertService
+
+    def handle(self, operation: str, exc: Exception, level: int = logging.ERROR) -> None:
+        self.logger.log(
+            level,
+            "EXCEPTION | operation=%s | message=%s | stack_trace=%s",
             operation,
-            duration_ms,
-            exc,
+            str(exc),
+            traceback.format_exc().strip(),
         )
-        raise
-    else:
-        duration_ms = (time.perf_counter() - state.start_time) * 1000
-        logger.info(
-            "TRACE END | operation=%s | result=SUCCESS | duration_ms=%.2f",
-            operation,
-            duration_ms,
-        )
+        self.alerts.notify(operation, level, str(exc))
 
 
 class TaskManager:
     def __init__(self, logger: logging.Logger | None = None) -> None:
-        self.tasks: List[str] = []
         self.logger = logger or configure_logger()
+        self.tasks: List[str] = []
+        self.alerts = AlertService(self.logger)
+        self.exceptions = ExceptionHandler(self.logger, self.alerts)
         self.logger.info("TaskManager initialized")
 
-    def add_task(self, task: str) -> None:
-        with trace_operation(self.logger, "Add"):
+    def _execute(self, operation: str, action: Callable[[], T], fallback: T, level: int = logging.ERROR) -> T:
+        try:
+            return action()
+        except Exception as exc:
+            self.exceptions.handle(operation, exc, level=level)
+            return fallback
+
+    def add_task(self, task: str) -> bool:
+        def action() -> bool:
+            if task is None:
+                raise ValueError("Task text cannot be None")
             if not task.strip():
-                self.logger.warning(
-                    "RESULT | operation=Add | status=WARNING | reason=Empty task text"
-                )
-                return
-
+                raise ValueError("Task text cannot be empty")
             self.tasks.append(task)
-            self.logger.info(
-                "RESULT | operation=Add | status=SUCCESS | task='%s' | total=%d",
-                task,
-                len(self.tasks),
-            )
+            self.logger.info("RESULT | operation=Add | status=SUCCESS | task='%s'", task)
+            return True
 
-    def remove_task(self, task: str) -> None:
-        with trace_operation(self.logger, "Remove"):
-            if task in self.tasks:
-                self.tasks.remove(task)
-                self.logger.info(
-                    "RESULT | operation=Remove | status=SUCCESS | task='%s' | total=%d",
-                    task,
-                    len(self.tasks),
-                )
-            else:
-                self.logger.warning(
-                    "RESULT | operation=Remove | status=WARNING | reason=Task not found | task='%s'",
-                    task,
-                )
+        return self._execute("Add", action, fallback=False, level=logging.ERROR)
+
+    def remove_task(self, task: str) -> bool:
+        def action() -> bool:
+            if task is None:
+                raise ValueError("Task text cannot be None")
+            self.tasks.remove(task)
+            self.logger.info("RESULT | operation=Remove | status=SUCCESS | task='%s'", task)
+            return True
+
+        return self._execute("Remove", action, fallback=False, level=logging.ERROR)
 
     def list_tasks(self) -> List[str]:
-        with trace_operation(self.logger, "List"):
-            if not self.tasks:
-                self.logger.warning("RESULT | operation=List | status=WARNING | reason=No tasks")
-                return []
+        def action() -> List[str]:
+            snapshot = list(self.tasks)
+            self.logger.info("RESULT | operation=List | status=SUCCESS | total=%d", len(snapshot))
+            return snapshot
 
-            self.logger.info(
-                "RESULT | operation=List | status=SUCCESS | total=%d",
-                len(self.tasks),
-            )
-            return list(self.tasks)
+        return self._execute("List", action, fallback=[], level=logging.ERROR)
